@@ -88,19 +88,20 @@ export function getReadOnlyProvider(): anchor.AnchorProvider {
   // ダミー鍵（公開鍵だけ実質使用）
   const kp = Keypair.generate();
 
-  // NodeWallet 相当の shape も満たす
+  // Anchor の Wallet shape + NodeWallet の payer を満たす
   const dummyWallet: anchor.Wallet & { payer: Keypair } = {
     publicKey: kp.publicKey,
     payer: kp,
-    // 読み取り専用なので no-op でOK（型は any に寄せておくと楽）
-    async signTransaction(tx: any) { return tx; },
-    async signAllTransactions(txs: any[]) { return txs; },
+    // 読み取り専用なので no-op 実装でOK
+    async signTransaction<T>(tx: T): Promise<T> { return tx; },
+    async signAllTransactions<T>(txs: T[]): Promise<T[]> { return txs; },
   };
 
   return new anchor.AnchorProvider(connection, dummyWallet, {
     commitment: 'confirmed',
   });
 }
+
 
 /** 署名可能 Provider */
 export function getSignerProvider(wallet: anchor.Wallet): anchor.AnchorProvider {

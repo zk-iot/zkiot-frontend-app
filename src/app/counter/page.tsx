@@ -1,64 +1,73 @@
-'use client';
+"use client";
 
-import React, { useEffect, useMemo, useState } from 'react';
-import * as anchor from '@coral-xyz/anchor';
-import { PublicKey } from '@solana/web3.js';
-import { usePrivy } from '@privy-io/react-auth';
-import { useWallets as useSolanaWallets } from '@privy-io/react-auth/solana';
+import React, { useEffect, useMemo, useState } from "react";
+import * as anchor from "@coral-xyz/anchor";
+import { PublicKey } from "@solana/web3.js";
+import { usePrivy } from "@privy-io/react-auth";
+import { useWallets as useSolanaWallets } from "@privy-io/react-auth/solana";
 
 import {
   getReadWorkspace,
   getSignerWorkspace,
   PROGRAM_ID,
   type WalletLike,
-} from '@/lib/anchor/client';
+} from "@/lib/anchor/client";
 
 export default function CounterPage() {
   const { ready: readyAuth, authenticated, login, logout } = usePrivy();
   const { ready: readySol, wallets } = useSolanaWallets();
-
-  // Privy の最初の Solana Wallet 情報（署名できない場合あり）
   const privyWallet = wallets?.[0] as unknown as WalletLike | undefined;
 
-  // 読み取り用は常に作っておく（Keypairダミー）
+  // 読み取り用 workspace
   const readWs = useMemo(() => getReadWorkspace(), []);
 
-  // owner 公開鍵（Privy の address から）
-  const [ownerPk, setOwnerPk] = useState<PublicKey | null>(null);
-  useEffect(() => {
-    const pk =
-      privyWallet?.address
-        ? new PublicKey(privyWallet.address)
-        : (privyWallet as any)?.publicKey?.toBase58
-        ? new PublicKey((privyWallet as any).publicKey.toBase58())
-        : null;
-    setOwnerPk(pk);
-  }, [privyWallet]);
-
-  // PDA（seeds = ["counter", owner]）
-  const [pda, setPda] = useState<PublicKey | null>(null);
-  useEffect(() => {
-    if (!ownerPk) return setPda(null);
-    const [derived] = PublicKey.findProgramAddressSync(
-      [Buffer.from('counter'), ownerPk.toBuffer()],
-      PROGRAM_ID
-    );
-    setPda(derived);
-  }, [ownerPk]);
-
-  // UI state
+  // 表示用 state
+  const [authority, setAuthority] = useState<PublicKey | null>(null);
+  const [counterPda, setCounterPda] = useState<PublicKey | null>(null);
   const [count, setCount] = useState<string | null>(null);
   const [txSig, setTxSig] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // 読み取り（常に readWs でOK）
-  const read = async () => {
-    if (!pda) return;
+  // 実署名者に合わせて owner/PDA を決定して処理を実行
+  const withSigner = async (
+    fn: (ctx: {
+      ws: NonNullable<Awaited<ReturnType<typeof getSignerWorkspace>>>;
+      owner: PublicKey;
+      counter: PublicKey;
+    }) => Promise<void>
+  ) => {
+    setLoading(true);
+    setErr(null);
+    setTxSig(null);
+    try {
+      const ws = await getSignerWorkspace(privyWallet ?? null);
+      if (!ws) throw new Error("No signable Solana wallet (Privy/Phantom).");
+
+      const owner = ws.provider.wallet.publicKey;
+      const [counter] = PublicKey.findProgramAddressSync(
+        [owner.toBuffer()], // seeds = [authority] に一致
+        PROGRAM_ID
+      );
+
+      // 表示も同期
+      setAuthority(owner);
+      setCounterPda(counter);
+
+      await fn({ ws, owner, counter });
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 読み取り（read-only）
+  const readFor = async (pda: PublicKey) => {
     setLoading(true);
     setErr(null);
     try {
-      const acc = await (readWs.program.account as any)['counter'].fetch(pda);
+      const acc = await (readWs.program.account as any)["counter"].fetch(pda);
       setCount(acc.count.toString());
     } catch (e: any) {
       setCount(null);
@@ -68,113 +77,126 @@ export default function CounterPage() {
     }
   };
 
-  useEffect(() => {
-    if (readyAuth && readySol && pda) read();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [readyAuth, readySol, pda]);
-
-  // 署名用 workspace をその場で確保（Privy→Phantomの順）
-  const withSigner = async (fn: (ws: Awaited<ReturnType<typeof getSignerWorkspace>>) => Promise<void>) => {
-    setLoading(true);
-    setErr(null);
-    setTxSig(null);
-    try {
-      const ws = await getSignerWorkspace(privyWallet ?? null);
-      if (!ws) {
-        throw new Error('署名可能な Solana ウォレットが見つかりません（Privy で signTransaction が無いか、Phantom 未接続）。');
-      }
-      await fn(ws);
-    } catch (e: any) {
-      setErr(e?.message ?? String(e));
-    } finally {
-      setLoading(false);
-    }
+  const read = async () => {
+    if (!counterPda) return;
+    await readFor(counterPda);
   };
 
-  const initialize = async () => {
-    if (!ownerPk || !pda) return;
-    await withSigner(async (ws) => {
-      const tx = await (ws!.program.methods as any)
-        .initialize()
+  useEffect(() => {
+    // ログイン済みで、かつ PDA がわかっていれば自動で read
+    if (readyAuth && readySol && counterPda) read();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [readyAuth, readySol, counterPda]);
+
+  // tx: create
+  const createCounter = async () => {
+    await withSigner(async ({ ws, owner, counter }) => {
+      const tx = await (ws.program.methods as any)
+        .createCounter()
         .accounts({
-          counter: pda,
-          signer: ownerPk,
+          authority: owner,
+          counter,
           systemProgram: anchor.web3.SystemProgram.programId,
         })
         .rpc();
       setTxSig(tx);
-      await read();
+      await readFor(counter);
     });
   };
 
-  const increment = async () => {
-    if (!ownerPk || !pda) return;
-    await withSigner(async (ws) => {
-      const tx = await (ws!.program.methods as any)
-        .increment()
-        .accounts({ counter: pda, signer: ownerPk })
+  // tx: update (+1)
+  const updateCounter = async () => {
+    await withSigner(async ({ ws, owner, counter }) => {
+      const tx = await (ws.program.methods as any)
+        .updateCounter()
+        .accounts({
+          authority: owner,
+          counter,
+        })
         .rpc();
       setTxSig(tx);
-      await read();
+      await readFor(counter);
     });
   };
 
-  const network = 'devnet';
+  const network = "devnet";
 
   return (
     <main className="mx-auto max-w-xl p-6 space-y-6">
-      <h1 className="text-2xl font-bold">Counter (Privy/Phantom hybrid)</h1>
+      <h1 className="text-2xl font-bold">Counter (PDA by authority)</h1>
 
       <div className="text-sm opacity-80 space-y-1">
-        <div>Auth ready: {String(readyAuth)} / Sol ready: {String(readySol)}</div>
+        <div>
+          Auth ready: {String(readyAuth)} / Sol ready: {String(readySol)}
+        </div>
         <div>Authenticated: {String(authenticated)}</div>
-        <div>Program ID: <span className="font-mono break-all">{PROGRAM_ID.toBase58()}</span></div>
-        <div>Owner: {ownerPk ? ownerPk.toBase58() : '(no wallet)'}</div>
-        <div>PDA: {pda ? pda.toBase58() : '-'}</div>
+        <div>
+          Program ID:{" "}
+          <span className="font-mono break-all">
+            {PROGRAM_ID.toBase58()}
+          </span>
+        </div>
+        <div>
+          Authority:{" "}
+          {authority ? authority.toBase58() : "(not decided yet)"}
+        </div>
+        <div>PDA(counter): {counterPda ? counterPda.toBase58() : "-"}</div>
       </div>
 
       <div className="flex flex-wrap items-center gap-3">
         {!authenticated ? (
-          <button className="px-3 py-2 rounded-2xl shadow border" onClick={() => login()}>
+          <button
+            className="px-3 py-2 rounded-2xl shadow border"
+            onClick={() => login()}
+          >
             Login
           </button>
         ) : (
-          <button className="px-3 py-2 rounded-2xl shadow border" onClick={() => logout()}>
+          <button
+            className="px-3 py-2 rounded-2xl shadow border"
+            onClick={() => logout()}
+          >
             Logout
           </button>
         )}
 
-        <button className="px-3 py-2 rounded-2xl shadow border" onClick={read} disabled={!pda || loading}>
+        <button
+          className="px-3 py-2 rounded-2xl shadow border"
+          onClick={createCounter}
+          disabled={loading}
+          title="Create PDA counter for the current signer"
+        >
+          Create
+        </button>
+
+        <button
+          className="px-3 py-2 rounded-2xl shadow border"
+          onClick={updateCounter}
+          disabled={loading}
+          title="Increment the counter by 1"
+        >
+          Update (+1)
+        </button>
+
+        <button
+          className="px-3 py-2 rounded-2xl shadow border"
+          onClick={read}
+          disabled={!counterPda || loading}
+        >
           Read
-        </button>
-
-        <button
-          className="px-3 py-2 rounded-2xl shadow border"
-          onClick={initialize}
-          disabled={!pda || loading}
-          title="Privy で署名不可なら Phantom にフォールバックします"
-        >
-          Initialize
-        </button>
-
-        <button
-          className="px-3 py-2 rounded-2xl shadow border"
-          onClick={increment}
-          disabled={!pda || loading}
-          title="Privy で署名不可なら Phantom にフォールバックします"
-        >
-          Increment
         </button>
       </div>
 
       <div className="text-sm space-y-2">
         {loading && <div>Loading...</div>}
-        {typeof count === 'string' && (
-          <div>count: <span className="font-mono">{count}</span></div>
+        {typeof count === "string" && (
+          <div>
+            count: <span className="font-mono">{count}</span>
+          </div>
         )}
         {txSig && (
           <div className="break-all">
-            tx:{' '}
+            tx:{" "}
             <a
               className="underline"
               target="_blank"
@@ -189,6 +211,7 @@ export default function CounterPage() {
     </main>
   );
 }
+
 
 
 
